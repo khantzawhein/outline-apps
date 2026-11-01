@@ -23,6 +23,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
 import android.net.VpnService;
+import android.os.DeadObjectException;
 import android.os.IBinder;
 import android.os.RemoteException;
 import androidx.annotation.Nullable;
@@ -101,13 +102,23 @@ public class OutlinePlugin extends CordovaPlugin {
 
   private static final int REQUEST_CODE_PREPARE_VPN = 100;
 
+  // How long an action waits for the system to (re)connect the VPN service before rebinding it from
+  // scratch, and then how long it waits on that fresh binding before giving up. A healthy bind
+  // takes well under a second, and the system restarts a crashed service after about one.
+  private static final long SERVICE_BIND_TIMEOUT_MS = 4000;
+
   // AIDL interface for VpnTunnelService, which is bound for the lifetime of this class.
   // The VpnTunnelService runs in a sub process and is thread-safe.
-  // A race condition may occur when calling methods on this instance if the service unbinds.
-  // We catch any exceptions, which should generally be transient and recoverable, and report them
-  // to the WebView.
+  // The service process can die at any time, and some OEM builds (notably Xiaomi HyperOS) kill it
+  // in the background and never restart it. Actions therefore get the service through
+  // getVpnTunnelService(), which rebinds from scratch when the binding is not coming back.
+  // Guarded by serviceLock, which is also notified whenever the service connects.
   private IVpnTunnelService vpnTunnelService;
-  private String errorReportingApiKey;
+  // Set when the binding can no longer deliver a service: the system reported it dead, or a call
+  // found the service proxy dead. Guarded by serviceLock.
+  private boolean bindingBroken;
+  private final Object serviceLock = new Object();
+  private volatile String errorReportingApiKey;
   private StartVpnRequest startVpnRequest;
   // Tunnel status change callback.
   private CallbackContext statusCallback;
@@ -116,13 +127,34 @@ public class OutlinePlugin extends CordovaPlugin {
   private final ServiceConnection vpnServiceConnection = new ServiceConnection() {
     @Override
     public void onServiceConnected(ComponentName className, IBinder binder) {
-      vpnTunnelService = IVpnTunnelService.Stub.asInterface(binder);
+      synchronized (serviceLock) {
+        vpnTunnelService = IVpnTunnelService.Stub.asInterface(binder);
+        bindingBroken = false;
+        serviceLock.notifyAll();
+      }
       LOG.info("VPN service connected");
+    }
+
+    // The system will never reconnect this binding: it has to be unbound and bound again. That
+    // happens on the next action rather than here, so an app in the background does not fight an
+    // OS that keeps killing the service.
+    @Override
+    public void onBindingDied(ComponentName className) {
+      LOG.warning("VPN service binding died");
+      synchronized (serviceLock) {
+        vpnTunnelService = null;
+        bindingBroken = true;
+      }
     }
 
     @Override
     public void onServiceDisconnected(ComponentName className) {
       LOG.warning("VPN service disconnected");
+      // Drop the proxy to the dead process. Calls on it would fail with DeadObjectException for as
+      // long as the service stays down, which on some devices is until the app is force stopped.
+      synchronized (serviceLock) {
+        vpnTunnelService = null;
+      }
       // Rebind the service so the VPN automatically reconnects if the service process crashed.
       Context context = getBaseContext();
       Intent rebind = new Intent(context, VpnTunnelService.class);
@@ -154,7 +186,11 @@ public class OutlinePlugin extends CordovaPlugin {
   public void onDestroy() {
     Context context = getBaseContext();
     context.unregisterReceiver(vpnTunnelBroadcastReceiver);
-    context.unbindService(vpnServiceConnection);
+    try {
+      context.unbindService(vpnServiceConnection);
+    } catch (IllegalArgumentException e) {
+      // Not bound: a rebind was interrupted between its unbind and bind.
+    }
   }
 
   @Override
@@ -219,7 +255,7 @@ public class OutlinePlugin extends CordovaPlugin {
         } else if (Action.STOP.is(action)) {
           final String tunnelId = args.getString(0);
           LOG.info(String.format(Locale.ROOT, "Stopping VPN tunnel %s", tunnelId));
-          sendActionResult(callback, vpnTunnelService.stopTunnel(tunnelId));
+          sendActionResult(callback, getVpnTunnelService().stopTunnel(tunnelId));
         } else if (Action.IS_RUNNING.is(action)) {
           final String tunnelId = args.getString(0);
           boolean isActive = isTunnelActive(tunnelId);
@@ -230,7 +266,7 @@ public class OutlinePlugin extends CordovaPlugin {
           errorReportingApiKey = args.getString(0);
           // Treat failures to initialize error reporting as unexpected by propagating exceptions.
           SentryErrorReporter.init(getBaseContext(), errorReportingApiKey);
-          vpnTunnelService.initErrorReporting(errorReportingApiKey);
+          getVpnTunnelService().initErrorReporting(errorReportingApiKey);
           callback.success();
         } else if (Action.REPORT_EVENTS.is(action)) {
           final String uuid = args.getString(0);
@@ -285,18 +321,124 @@ public class OutlinePlugin extends CordovaPlugin {
     tunnelConfig.id = tunnelId;
     tunnelConfig.name = serverName;
     tunnelConfig.transportConfig = transportConfig;
-    return vpnTunnelService.startTunnel(tunnelConfig);
+    try {
+      return getVpnTunnelService().startTunnel(tunnelConfig);
+    } catch (DeadObjectException e) {
+      // The VPN process died after we got the proxy. Retry once on a fresh binding.
+      LOG.log(Level.WARNING, "VPN service died, retrying the tunnel start", e);
+      markVpnServiceDead();
+      return getVpnTunnelService().startTunnel(tunnelConfig);
+    }
   }
 
   // Returns whether the VPN service is running a particular tunnel instance.
   private boolean isTunnelActive(final String tunnelId) {
+    // Don't wait for a binding: this is a status poll, and no service means no active tunnel.
+    final IVpnTunnelService service;
+    synchronized (serviceLock) {
+      service = vpnTunnelService;
+    }
+    if (service == null) {
+      return false;
+    }
     try {
-      return vpnTunnelService.isTunnelActive(tunnelId);
+      return service.isTunnelActive(tunnelId);
+    } catch (DeadObjectException e) {
+      markVpnServiceDead();
     } catch (Exception e) {
       LOG.log(Level.SEVERE,
           String.format(Locale.ROOT, "Failed to determine if tunnel is active: %s", tunnelId), e);
     }
     return false;
+  }
+
+  // VPN service binding
+
+  /**
+   * Returns the VPN service, waiting for it to connect if necessary.
+   *
+   * If the system does not (re)connect the binding within SERVICE_BIND_TIMEOUT_MS, or reported it
+   * dead, it is not going to: rebind from scratch, the way a force stop would, and wait for that.
+   * Must not be called on the main thread, which delivers the connection.
+   *
+   * @throws RemoteException if the service does not connect even after rebinding.
+   */
+  private IVpnTunnelService getVpnTunnelService() throws RemoteException {
+    IVpnTunnelService service = awaitVpnTunnelService(SERVICE_BIND_TIMEOUT_MS);
+    if (service != null) {
+      return service;
+    }
+    LOG.warning("VPN service is not connected, rebinding");
+    rebindVpnService();
+    service = awaitVpnTunnelService(SERVICE_BIND_TIMEOUT_MS);
+    if (service == null) {
+      throw new RemoteException("VPN service is unavailable");
+    }
+    return service;
+  }
+
+  // Waits up to timeoutMs for a live service. Returns null right away if the binding is broken,
+  // since no connection will arrive on it.
+  @Nullable
+  private IVpnTunnelService awaitVpnTunnelService(long timeoutMs) {
+    final long deadline = System.currentTimeMillis() + timeoutMs;
+    synchronized (serviceLock) {
+      while (true) {
+        if (vpnTunnelService != null && !vpnTunnelService.asBinder().isBinderAlive()) {
+          // The proxy outlived the VPN process without onServiceDisconnected clearing it.
+          vpnTunnelService = null;
+          bindingBroken = true;
+        }
+        if (vpnTunnelService != null || bindingBroken) {
+          return vpnTunnelService;
+        }
+        final long remaining = deadline - System.currentTimeMillis();
+        if (remaining <= 0) {
+          return null;
+        }
+        try {
+          serviceLock.wait(remaining);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          return null;
+        }
+      }
+    }
+  }
+
+  // Clears the service proxy if its process is gone, so the next action rebinds.
+  private void markVpnServiceDead() {
+    synchronized (serviceLock) {
+      if (vpnTunnelService == null || !vpnTunnelService.asBinder().isBinderAlive()) {
+        vpnTunnelService = null;
+        bindingBroken = true;
+      }
+    }
+  }
+
+  /**
+   * Replaces the binding to the VPN service with a fresh one. Unbinding first matters: while the
+   * system holds a dead service waiting for a restart it will not perform, binding again on top of
+   * the old binding does nothing. One unbind also drops every binding onServiceDisconnected stacked
+   * up on this connection.
+   *
+   * Only call this when the service is known to be gone or unresponsive: if the old binding is the
+   * only thing keeping a live service running, unbinding destroys it and its tunnel.
+   */
+  private void rebindVpnService() {
+    synchronized (serviceLock) {
+      vpnTunnelService = null;
+      bindingBroken = false;
+    }
+    final Context context = getBaseContext();
+    try {
+      context.unbindService(vpnServiceConnection);
+    } catch (IllegalArgumentException e) {
+      // Not bound.
+    }
+    final Intent intent = new Intent(context, VpnTunnelService.class);
+    intent.putExtra(MessageData.ERROR_REPORTING_API_KEY.value, errorReportingApiKey);
+    context.bindService(intent, vpnServiceConnection, Context.BIND_AUTO_CREATE);
   }
 
   // Broadcasts

@@ -22,6 +22,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.net.VpnService
+import android.os.DeadObjectException
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -38,6 +39,7 @@ import com.getcapacitor.annotation.ActivityCallback
 import com.getcapacitor.annotation.CapacitorPlugin
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.logging.Logger
 import org.json.JSONException
 import org.outline.log.OutlineLogger
 import org.outline.log.SentryErrorReporter
@@ -54,6 +56,9 @@ class CapacitorPluginOutline : Plugin() {
   private data class StartVpnRequest(
       val args: StartArgs,
       val call: PluginCall,
+      // Whether this request already found the service dead once. It gets one fresh binding,
+      // and fails instead of rebinding again if that one is dead as well.
+      val isRetry: Boolean = false,
   )
 
   private data class StartArgs(
@@ -71,19 +76,47 @@ class CapacitorPluginOutline : Plugin() {
   private var errorReportingApiKey: String? = null
   private var pendingVpnPermissionRequest: StartVpnRequest? = null
   private var pendingServiceBindRequest: StartVpnRequest? = null
+  // Set when the binding can no longer deliver a service: the VPN process died and the system
+  // reported the binding dead, or a call found the service proxy dead. Some OEM builds (notably
+  // Xiaomi HyperOS) kill the :vpn process in the background and never restart it, so waiting for
+  // onServiceConnected would wait forever. The next start request rebinds from scratch instead.
+  private var bindingBroken = false
+  // Whether the pending start request has already triggered a rebind, so it gets exactly one.
+  private var reboundForPendingStart = false
   private val executor = Executors.newCachedThreadPool()
+  private val mainHandler = Handler(Looper.getMainLooper())
 
   private val vpnServiceConnection = object : ServiceConnection {
     override fun onServiceConnected(name: ComponentName, service: IBinder) {
       val pending: StartVpnRequest?
       synchronized(stateLock) {
         vpnTunnelService = IVpnTunnelService.Stub.asInterface(service)
+        bindingBroken = false
+        reboundForPendingStart = false
         pending = pendingServiceBindRequest
         pendingServiceBindRequest = null
       }
+      mainHandler.removeCallbacks(serviceBindWatchdog)
       if (pending != null) {
-        executeStartTunnel(pending.call, pending.args)
+        executeStartTunnel(pending.call, pending.args, pending.isRetry)
       }
+    }
+
+    /**
+     * The system will never reconnect this binding: it has to be unbound and bound again. Recover
+     * right away only when a start request is waiting on it; otherwise leave it to the next request,
+     * so an app in the background does not fight an OS that keeps killing the service.
+     */
+    override fun onBindingDied(name: ComponentName) {
+      LOG.warning("VPN service binding died")
+      val rebind = synchronized(stateLock) {
+        vpnTunnelService = null
+        bindingBroken = true
+        val waiting = pendingServiceBindRequest != null && !reboundForPendingStart
+        if (waiting) reboundForPendingStart = true
+        waiting
+      }
+      if (rebind) rebindVpnService()
     }
 
     override fun onServiceDisconnected(name: ComponentName) {
@@ -137,14 +170,13 @@ class CapacitorPluginOutline : Plugin() {
         Context.RECEIVER_NOT_EXPORTED,
     )
 
-    context.bindService(
-        Intent(context, VpnTunnelService::class.java),
-        vpnServiceConnection,
-        Context.BIND_AUTO_CREATE,
-    )
+    bindVpnService()
   }
 
   override fun handleOnDestroy() {
+    // Drops the bind watchdog and any posted rebind, which would otherwise bind the service again
+    // after it is unbound below.
+    mainHandler.removeCallbacksAndMessages(null)
     val context = baseContext()
     try {
       context.unregisterReceiver(vpnTunnelBroadcastReceiver)
@@ -212,6 +244,9 @@ class CapacitorPluginOutline : Plugin() {
         }
         val result = service.stopTunnel(tunnelId)
         if (result == null) call.resolve() else call.reject(result.errorJson)
+      } catch (e: DeadObjectException) {
+        markVpnServiceDead()
+        sendErrorResult(call, platformErrorFromException(e))
       } catch (e: Exception) {
         sendErrorResult(call, platformErrorFromException(e))
       }
@@ -230,6 +265,9 @@ class CapacitorPluginOutline : Plugin() {
         val service = synchronized(stateLock) { vpnTunnelService }
         val isActive = try {
           service?.isTunnelActive(tunnelId) ?: false
+        } catch (e: DeadObjectException) {
+          markVpnServiceDead()
+          false
         } catch (e: Exception) {
           false
         }
@@ -256,6 +294,9 @@ class CapacitorPluginOutline : Plugin() {
         SentryErrorReporter.init(baseContext(), apiKey)
         service?.initErrorReporting(apiKey)
         call.resolve()
+      } catch (e: DeadObjectException) {
+        markVpnServiceDead()
+        sendErrorResult(call, platformErrorFromException(e))
       } catch (e: Exception) {
         sendErrorResult(call, platformErrorFromException(e))
       }
@@ -433,19 +474,27 @@ class CapacitorPluginOutline : Plugin() {
 
   private sealed class StartDecision {
     data class Dispatch(val service: IVpnTunnelService) : StartDecision()
-    object Queued : StartDecision()
+    data class Queued(val rebindNow: Boolean) : StartDecision()
     object AlreadyPending : StartDecision()
   }
 
-  private fun executeStartTunnel(call: PluginCall, args: StartArgs) {
+  private fun executeStartTunnel(call: PluginCall, args: StartArgs, isRetry: Boolean = false) {
     val decision = synchronized(stateLock) {
       val current = vpnTunnelService
       when {
-        current != null -> StartDecision.Dispatch(current)
+        current != null && current.asBinder().isBinderAlive -> StartDecision.Dispatch(current)
         pendingServiceBindRequest != null -> StartDecision.AlreadyPending
         else -> {
-          pendingServiceBindRequest = StartVpnRequest(args, call)
-          StartDecision.Queued
+          if (current != null) {
+            // The proxy outlived the VPN process without onServiceDisconnected clearing it.
+            vpnTunnelService = null
+            bindingBroken = true
+          }
+          pendingServiceBindRequest = StartVpnRequest(args, call, isRetry)
+          // A broken binding will never call onServiceConnected, so rebind now. Otherwise give
+          // the system the chance to reconnect it, and let the watchdog rebind if it does not.
+          reboundForPendingStart = bindingBroken
+          StartDecision.Queued(rebindNow = bindingBroken)
         }
       }
     }
@@ -458,9 +507,12 @@ class CapacitorPluginOutline : Plugin() {
         // No-op for an unsaved call.
         bridge.releaseCall(call)
       }
-      StartDecision.Queued -> {
+      is StartDecision.Queued -> {
         call.setKeepAlive(true)
         saveCall(call)
+        if (decision.rebindNow) rebindVpnService()
+        mainHandler.removeCallbacks(serviceBindWatchdog)
+        mainHandler.postDelayed(serviceBindWatchdog, SERVICE_BIND_TIMEOUT_MS)
       }
       is StartDecision.Dispatch -> executor.execute {
         try {
@@ -471,15 +523,100 @@ class CapacitorPluginOutline : Plugin() {
           }
           val result = decision.service.startTunnel(config)
           if (result == null) call.resolve() else call.reject(result.errorJson)
+        } catch (e: DeadObjectException) {
+          if (!isRetry) {
+            // The VPN process died after we got the proxy. Retry once on a fresh binding; the
+            // call stays saved until that attempt completes it.
+            markVpnServiceDead()
+            executeStartTunnel(call, args, isRetry = true)
+            return@execute
+          }
+          sendErrorResult(call, platformErrorFromException(e))
         } catch (e: Exception) {
           sendErrorResult(call, platformErrorFromException(e))
-        } finally {
-          // Release the saved-call slot held when this call was queued
-          // (via prepareVpnService or the Queued branch above). For an
-          // unsaved call, releaseCall is a no-op.
-          bridge.releaseCall(call)
+        }
+        // Release the saved-call slot held when this call was queued
+        // (via prepareVpnService or the Queued branch above). For an
+        // unsaved call, releaseCall is a no-op.
+        bridge.releaseCall(call)
+      }
+    }
+  }
+
+  /**
+   * Runs [SERVICE_BIND_TIMEOUT_MS] after a start request is queued without a service. If the
+   * system has not reconnected the binding by then, it is not going to: rebind from scratch, the
+   * way a force stop would. If that does not connect either, fail the request instead of leaving
+   * the UI spinning forever.
+   */
+  private val serviceBindWatchdog = object : Runnable {
+    override fun run() {
+      var failed: StartVpnRequest? = null
+      val rebind = synchronized(stateLock) {
+        when {
+          pendingServiceBindRequest == null || vpnTunnelService != null -> false
+          !reboundForPendingStart -> {
+            reboundForPendingStart = true
+            true
+          }
+          else -> {
+            failed = pendingServiceBindRequest
+            pendingServiceBindRequest = null
+            reboundForPendingStart = false
+            false
+          }
         }
       }
+      if (rebind) {
+        rebindVpnService()
+        mainHandler.postDelayed(this, SERVICE_BIND_TIMEOUT_MS)
+      }
+      failed?.let {
+        sendErrorResult(it.call, vpnServiceUnavailableError())
+        bridge.releaseCall(it.call)
+      }
+    }
+  }
+
+  /** Clears the service proxy if its process is gone, so the next start request rebinds. */
+  private fun markVpnServiceDead() {
+    synchronized(stateLock) {
+      val current = vpnTunnelService
+      if (current == null || !current.asBinder().isBinderAlive) {
+        vpnTunnelService = null
+        bindingBroken = true
+      }
+    }
+  }
+
+  private fun bindVpnService() {
+    val context = baseContext()
+    val apiKey = synchronized(stateLock) { errorReportingApiKey }
+    val intent = Intent(context, VpnTunnelService::class.java).apply {
+      if (apiKey != null) {
+        putExtra(VpnTunnelService.MessageData.ERROR_REPORTING_API_KEY.value, apiKey)
+      }
+    }
+    context.bindService(intent, vpnServiceConnection, Context.BIND_AUTO_CREATE)
+  }
+
+  /**
+   * Replaces the binding to the VPN service with a fresh one. Unbinding first matters: while the
+   * system holds a dead service waiting for a restart it will not perform, binding again on top
+   * of the old binding does nothing. One unbind also drops every binding this connection stacked
+   * up through [ServiceConnection.onServiceDisconnected].
+   *
+   * Only call this when the service is known to be gone or unresponsive: if the old binding is
+   * the only thing keeping a live service running, unbinding destroys it and its tunnel.
+   */
+  private fun rebindVpnService() {
+    mainHandler.post {
+      synchronized(stateLock) {
+        vpnTunnelService = null
+        bindingBroken = false
+      }
+      kotlin.runCatching { baseContext().unbindService(vpnServiceConnection) }
+      bindVpnService()
     }
   }
 
@@ -533,9 +670,17 @@ class CapacitorPluginOutline : Plugin() {
   private fun baseContext(): Context = context.applicationContext
 
   companion object {
+    private val LOG = Logger.getLogger(CapacitorPluginOutline::class.java.name)
+
     // Must match the name of the @ActivityCallback method.
     private const val VPN_PERMISSION_CALLBACK = "onVpnPermissionResult"
     private const val STATUS_CHANGE_EVENT = "onStatusChange"
+
+    // How long a start request waits for the system to (re)connect the VPN service before the
+    // plugin rebinds it from scratch, and then how long it waits on that fresh binding before
+    // failing. A healthy bind takes well under a second, and the system restarts a crashed
+    // service after about one.
+    private const val SERVICE_BIND_TIMEOUT_MS = 4_000L
 
     // Any file:// document shares the single file:// storage origin, so this
     // reads the same namespace the Cordova build wrote to under www/.
